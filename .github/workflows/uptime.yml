@@ -1,0 +1,58 @@
+# Внешняя проверка сервера Axion Flow (облако компании, веб-версия): каждые 10 минут — /api/health.
+# Сервер не ответил три раза подряд — открывается задача «Сервер недоступен» (GitHub присылает письмо владельцу),
+# сервер снова отвечает — задача закрывается с отметкой о восстановлении. Одно письмо на сбой, без повторов.
+name: Проверка сервера
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+permissions:
+  issues: write
+
+concurrency:
+  group: uptime
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Запрос /api/health
+        id: health
+        run: |
+          ok=false
+          for i in 1 2 3; do
+            body=$(curl -s -m 20 https://flow.axionlabs.ru/api/health || true)
+            if echo "$body" | grep -q '"ok":true'; then ok=true; break; fi
+            echo "попытка $i: ${body:-нет ответа}"
+            sleep 20
+          done
+          echo "ok=$ok" >> "$GITHUB_OUTPUT"
+          echo "body=$(echo "${body:-нет ответа}" | head -c 300)" >> "$GITHUB_OUTPUT"
+
+      - name: Задача о недоступности — открыть или закрыть
+        uses: actions/github-script@v7
+        env:
+          OK: ${{ steps.health.outputs.ok }}
+          BODY: ${{ steps.health.outputs.body }}
+        with:
+          script: |
+            const title = 'Сервер недоступен: flow.axionlabs.ru'
+            const { owner, repo } = context.repo
+            const open = (await github.rest.issues.listForRepo({ owner, repo, state: 'open', labels: 'uptime' })).data
+            const now = new Date().toLocaleString('ru-RU', { timeZone: 'Europe/Moscow' })
+            if (process.env.OK !== 'true') {
+              if (!open.length) {
+                await github.rest.issues.create({ owner, repo, title, labels: ['uptime'],
+                  body: `${now} (МСК): https://flow.axionlabs.ru/api/health не отвечает три раза подряд.\n\nОтвет: \`${process.env.BODY}\`\n\nПроверьте виртуальные машины AxionFlow (192.168.2.119) и Nginx (192.168.2.209). Задача закроется сама, когда сервер снова ответит.` })
+                core.setFailed('сервер недоступен')
+              }
+            } else {
+              for (const i of open) {
+                await github.rest.issues.createComment({ owner, repo, issue_number: i.number, body: `${now} (МСК): сервер снова отвечает — ${process.env.BODY}` })
+                await github.rest.issues.update({ owner, repo, issue_number: i.number, state: 'closed' })
+              }
+            }
